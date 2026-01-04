@@ -1,12 +1,12 @@
 //! # PRISM NiV Bench - Phase 3.1 Execution Binary
 //!
-//! Scientific benchmark for Nipah Virus G Glycoprotein (2VWD.ptb) breathing analysis.
-//! Executes 10,000 steps of NLNM (Non-Linear Normal Mode) simulation with VRAM Guard protection.
+//! Scientific benchmark for Nipah Virus G Glycoprotein (2VWD.ptb) deep cryptic analysis.
+//! Executes 1,000,000 steps of NLNM (Non-Linear Normal Mode) simulation with VRAM Guard protection.
 //!
 //! ## Mission Profile
 //! - **Target**: Nipah Virus G Glycoprotein (2VWD structure)
-//! - **Objective**: Capture protein "breathing" motion via NLNM analysis
-//! - **Duration**: 10,000 simulation steps
+//! - **Objective**: Deep cryptic epitope discovery via extended NLNM analysis
+//! - **Duration**: 1,000,000 simulation steps (100x sampling depth)
 //! - **Physics**: PIMC/NLNM molecular dynamics with GPU acceleration
 //!
 //! ## Safety Protocol
@@ -28,8 +28,8 @@ use cudarc::driver::CudaContext;
 /// Path to the sovereign 2VWD.ptb data file
 const NIV_PTB_PATH: &str = "data/processed/2VWD.ptb";
 
-/// Target simulation steps for full breathing analysis
-const BREATHING_STEPS: u64 = 10_000;
+/// Target simulation steps for deep cryptic epitope analysis (100x boost)
+const BREATHING_STEPS: u64 = 1_000_000;
 
 /// Main execution entry point for Phase 3.1 - Sovereign Standard Compliance
 #[tokio::main]
@@ -116,8 +116,8 @@ async fn main() -> Result<(), PrismError> {
 
     log::info!("🚀 Molecular dynamics engine initialized");
 
-    // Execute 10,000 step NLNM breathing simulation (The Breathing Run)
-    log::info!("🌬️ Beginning {} step NLNM breathing analysis...", BREATHING_STEPS);
+    // Execute 1,000,000 step NLNM deep breathing simulation (The Deep Cryptic Run)
+    log::info!("🌬️ Beginning {} step NLNM deep cryptic analysis...", BREATHING_STEPS);
     let start_time = Instant::now();
 
     let phase_outcome = md_engine.run_nlnm_breathing(BREATHING_STEPS)?;

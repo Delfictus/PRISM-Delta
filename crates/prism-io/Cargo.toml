@@ -37,6 +37,9 @@ futures = "0.3"                         # Async utilities
 pin-project = "1.1"                     # Safe pinning for async streams
 parking_lot = "0.12"                    # High-performance locking primitives
 
+# CLI & Command Line Tools
+clap = { version = "4.0", features = ["derive"] }  # Command line argument parsing
+
 # Performance & Monitoring
 tracing = "0.1"                         # Structured logging
 metrics = "0.21"                        # Performance metrics collection
@@ -55,6 +58,14 @@ proptest = "1.4"                        # Property-based testing
 [[bin]]
 name = "prism-ingest"
 path = "src/bin/prism-ingest.rs"
+
+[[bin]]
+name = "prism-export"
+path = "src/bin/prism-export.rs"
+
+[[bin]]
+name = "prism-diff"
+path = "src/bin/prism-diff.rs"
 
 [features]
 default = ["gpu", "validation"]

@@ -3630,6 +3630,7 @@ dependencies = [
  "bio",
  "blake3",
  "bytemuck",
+ "clap",
  "criterion",
  "cuda-driver-sys",
  "cudarc",

@@ -439,6 +439,10 @@ impl HolographicBinaryFormat {
 
         file.flush()?;
 
+        // CRITICAL: Force OS to write bytes to physical storage before returning
+        // This prevents data loss if process crashes after logging "Trajectory Saved"
+        file.sync_all()?;
+
         tracing::info!(
             "Created .ptb file: {} atoms, {} bonds, {} bytes",
             self.header.atom_count,
