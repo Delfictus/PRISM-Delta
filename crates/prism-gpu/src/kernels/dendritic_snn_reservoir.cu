@@ -2,11 +2,11 @@
  * Dendritic Spiking Neural Network Reservoir for RL Agent
  *
  * This kernel implements a Leaky Integrate-and-Fire (LIF) reservoir
- * for processing 23-dimensional RL feature vectors and outputting
+ * for processing 40-dimensional RL feature vectors (with bio-chemistry) and outputting
  * high-dimensional filtered firing rates for linear readout.
  *
  * ARCHITECTURE:
- *   23 features → Input weights (23→N) → LIF neurons (N) → Filtered rates (N)
+ *   40 features → Input weights (40→N) → LIF neurons (N) → Filtered rates (N)
  *   where N = RESERVOIR_SIZE (default 512)
  *
  * LIF DYNAMICS:
@@ -36,9 +36,9 @@
 // FEATURE ADAPTER PROTOCOL - Enhanced for Cryptic Site Detection
 // ============================================================================
 
-// Architecture constants
-#define RAW_INPUT_DIM 23        // Raw feature vector size
-#define EXPANDED_INPUT_DIM 46   // With velocity features (23 raw + 23 delta)
+// Architecture constants (updated for bio-chemistry features)
+#define RAW_INPUT_DIM 40        // Raw feature vector size (with bio-chemistry: hydrophobic, anisotropy, frustration)
+#define EXPANDED_INPUT_DIM 80   // With velocity features (40 raw + 40 delta)
 #define RESERVOIR_SIZE 512      // Number of LIF neurons
 #define MAX_RESERVOIR 2048      // Maximum supported
 
@@ -156,7 +156,7 @@ extern "C" __global__ void init_snn_reservoir(
             // Non-zero weight with Gaussian distribution
             float weight = curand_normal(&rand_state) * INPUT_SCALE;
 
-            // Velocity features (23-45) get 2.5× higher magnitude (your gain=5.0 suggestion)
+            // Velocity features (40-79) get 2.5× higher magnitude (your gain=5.0 suggestion)
             if (input_idx >= RAW_INPUT_DIM) {
                 weight *= 2.5f;  // Higher sensitivity to temporal changes
             }
@@ -235,7 +235,7 @@ extern "C" __global__ void init_snn_reservoir(
  * 4. Generate spikes where V >= threshold
  * 5. Update filtered firing rates (exponential moving average)
  *
- * @param features         Input feature vector [RAW_INPUT_DIM = 23]
+ * @param features         Input feature vector [RAW_INPUT_DIM = 40]
  * @param membrane         In/Out: Membrane potentials [N]
  * @param filtered_rates   In/Out: Filtered firing rates [N]
  * @param input_weights    Input weight matrix [N * RAW_INPUT_DIM]
@@ -256,7 +256,7 @@ extern "C" __global__ void lif_step(
 
     if (neuron_idx >= reservoir_size) return;
 
-    // Step 1: Compute input current from features (raw 23-dim)
+    // Step 1: Compute input current from features (raw 40-dim)
     float I_input = 0.0f;
     for (int f = 0; f < RAW_INPUT_DIM; f++) {
         int weight_idx = neuron_idx * RAW_INPUT_DIM + f;
@@ -298,12 +298,12 @@ extern "C" __global__ void lif_step(
  * Multi-step LIF simulation with Feature Adapter Protocol
  *
  * ENHANCED with:
- * - 46-dimensional input (23 raw + 23 velocity features)
+ * - 80-dimensional input (40 raw + 40 velocity features)
  * - Tanh normalization for input scaling
  * - Adaptive per-neuron time constants
  * - Persistent state (no implicit reset)
  *
- * @param features         Input feature vector [EXPANDED_INPUT_DIM = 46]
+ * @param features         Input feature vector [EXPANDED_INPUT_DIM = 80]
  * @param membrane         In/Out: Membrane potentials [N]
  * @param filtered_rates   In/Out: Filtered firing rates [N]
  * @param input_weights    Input weight matrix [N * EXPANDED_INPUT_DIM]
@@ -339,8 +339,8 @@ extern "C" __global__ void lif_multistep(
         float weight = input_weights[weight_idx];
 
         // Apply tanh normalization with differential gain
-        // Raw features (0-22): standard gain preserves magnitude info
-        // Delta features (23-45): high gain amplifies small temporal changes
+        // Raw features (0-39): standard gain preserves magnitude info
+        // Delta features (40-79): high gain amplifies small temporal changes
         float gain = (f < RAW_INPUT_DIM) ? TANH_GAIN_RAW : TANH_GAIN_DELTA;
         float normalized_input = tanhf(features[f] * gain);
         I_input += weight * normalized_input;

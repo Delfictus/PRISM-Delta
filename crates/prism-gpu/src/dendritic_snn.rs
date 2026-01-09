@@ -43,11 +43,12 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream, CudaFunction, CudaModul
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
 
-/// Raw input feature dimension (matches PRISM-Learning)
-pub const INPUT_DIM: usize = 23;
+/// Raw input feature dimension (matches PRISM-Learning with bio-chemistry)
+/// Supports: 23 (legacy), 27, 31, 37, or 40 (full bio-chemistry)
+pub const INPUT_DIM: usize = 40;
 
 /// Expanded input dimension (raw + velocity features)
-pub const EXPANDED_INPUT_DIM: usize = 46;
+pub const EXPANDED_INPUT_DIM: usize = 80;
 
 /// Default reservoir size
 pub const DEFAULT_RESERVOIR_SIZE: usize = 512;
@@ -64,7 +65,7 @@ const BLOCK_SIZE: usize = 256;
 /// GPU-accelerated Spiking Neural Network Reservoir
 ///
 /// Implements the Feature Adapter Protocol with:
-/// - Input expansion (23 raw → 46 with velocities)
+/// - Input expansion (40 raw → 80 with velocities)
 /// - Tanh normalization (bounded inputs)
 /// - Structured sparse topology
 /// - Adaptive time constants
@@ -121,7 +122,7 @@ impl DendriticSNNReservoir {
     /// Creates a new SNN reservoir with custom parameters
     ///
     /// Implements Feature Adapter Protocol with:
-    /// - Expanded input weights for 46-dim features (23 raw + 23 velocity)
+    /// - Expanded input weights for 80-dim features (40 raw + 40 velocity)
     /// - Per-neuron adaptive time constants
     /// - Feature history tracking for velocity computation
     ///
@@ -317,13 +318,13 @@ impl DendriticSNNReservoir {
     ///
     /// Feature Adapter Protocol implementation:
     /// 1. Computes velocity features from previous call (delta = current - previous)
-    /// 2. Expands 23-dim input to 46-dim (raw + velocity)
+    /// 2. Expands 40-dim input to 80-dim (raw + velocity)
     /// 3. Applies tanh normalization in kernel
     /// 4. Runs LIF with adaptive time constants
     /// 5. Returns filtered firing rates (persistent across calls)
     ///
     /// # Arguments
-    /// * `features` - 23-dimensional raw feature vector
+    /// * `features` - 40-dimensional raw feature vector (with bio-chemistry)
     ///
     /// # Returns
     /// Reservoir state vector (size = reservoir_size)
@@ -340,14 +341,14 @@ impl DendriticSNNReservoir {
         }
 
         // =====================================================================
-        // FEATURE ADAPTER PROTOCOL: Compute velocity and expand to 46-dim
+        // FEATURE ADAPTER PROTOCOL: Compute velocity and expand to 80-dim
         // =====================================================================
         let mut expanded_features = vec![0.0f32; EXPANDED_INPUT_DIM];
 
-        // First 23 dims: raw features
+        // First 40 dims: raw features
         expanded_features[..INPUT_DIM].copy_from_slice(features);
 
-        // Next 23 dims: velocity features (current - previous)
+        // Next 40 dims: velocity features (current - previous)
         if let Some(ref prev) = self.prev_features {
             for i in 0..INPUT_DIM {
                 expanded_features[INPUT_DIM + i] = features[i] - prev[i];
