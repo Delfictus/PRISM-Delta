@@ -31,6 +31,7 @@ members = [
     "crates/prism-gnn",
     "crates/prism-lbs",
     "crates/prism-escape-extract",  # Real feature extraction for viral escape benchmark
+    "crates/prism-validation",      # Multi-tier validation: ATLAS, Apo-Holo, Retrospective
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Foundation Crates (Production-grade GPU Implementations) - DISABLED: missing dirs

@@ -13,7 +13,9 @@ pub mod mega_fused_batch;
 pub mod reservoir_construction;
 pub mod ve_swarm;
 pub mod polycentric_immunity;
-pub mod active_inference; 
+pub mod active_inference;
+pub mod bio_chemistry_gpu;
+pub mod prism_nova;
 
 // Essential exports
 pub use context::{GpuContext, GpuInfo, GpuSecurityConfig};
@@ -26,6 +28,8 @@ pub use mega_fused_batch::{MegaFusedBatchGpu, BatchStructureDesc, StructureInput
 pub use reservoir_construction::{BioReservoir, SparseConnection, compute_readout_weights};
 pub use polycentric_immunity::{PolycentricImmunityGpu, N_EPITOPE_CENTERS, N_PK_SCENARIOS, POLYCENTRIC_OUTPUT_DIM, DEFAULT_CROSS_REACTIVITY};
 pub use active_inference::{ActiveInferenceGpu, ActiveInferencePolicy};
+pub use bio_chemistry_gpu::{BiochemistryGpu, GpuAtomicMetadata, MAX_ATOMS as BIO_MAX_ATOMS};
+pub use prism_nova::{PrismNova, NovaConfig, NovaStepResult, RESERVOIR_SIZE as NOVA_RESERVOIR_SIZE};
 pub use memory::{VramGuard, VramInfo, VramGuardError, init_global_vram_guard, global_vram_guard};
 
 // Commented out unused modules to isolate benchmark requirements
