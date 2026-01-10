@@ -16,6 +16,12 @@ use crate::{BenchmarkMetrics, ValidationConfig};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+// AMBER ff14SB force field and topology generation
+use prism_physics::amber_ff14sb::{
+    AmberTopology, GpuTopology, PdbAtom, AmberAtomType,
+    get_atom_charge, get_lj_param, get_atom_mass,
+};
+
 // Re-export NOVA types for convenience
 pub use prism_gpu::{PrismNova, NovaConfig, NovaStepResult};
 
@@ -94,6 +100,10 @@ pub struct SimulationConfig {
     pub save_interval: usize,
     /// GPU device index
     pub gpu_device: usize,
+    /// Use coarse-grained (C-alpha only) representation
+    /// When true: 1 atom per residue (faster, fits in GPU shared memory)
+    /// When false: all atoms (more accurate but limited to ~60 residues)
+    pub coarse_grained: bool,
 }
 
 impl Default for SimulationConfig {
@@ -105,6 +115,7 @@ impl Default for SimulationConfig {
             goal_strength: 0.1,
             save_interval: 10,
             gpu_device: 0,
+            coarse_grained: true,  // Default to CA-only for GPU compatibility
         }
     }
 }
@@ -115,6 +126,8 @@ impl From<&ValidationConfig> for SimulationConfig {
             n_steps: vc.steps_per_target,
             temperature: vc.temperature,
             gpu_device: vc.gpu_device,
+            coarse_grained: true,  // Use CA-only for validation benchmark
+            dt: 0.005,             // 5 fs timestep for CG (2.5x larger than all-atom)
             ..Default::default()
         }
     }
@@ -174,11 +187,23 @@ impl SimulationRunner {
         structure: &SimulationStructure,
         target_structure: Option<&SimulationStructure>,
     ) -> Result<SimulationTrajectory> {
+        // Determine effective atom count based on coarse-grained mode
+        // Use actual data lengths, not metadata
+        let effective_n_atoms = if self.config.coarse_grained {
+            structure.ca_positions.len()  // Actual CA atoms in PDB
+        } else {
+            structure.all_positions.len()  // Actual all-atoms in PDB
+        };
+
+        // Also update n_residues to match actual data
+        let effective_n_residues = structure.ca_positions.len();
+
         log::info!(
-            "Starting PRISM-NOVA simulation on {} ({} atoms, {} residues)",
+            "Starting PRISM-NOVA simulation on {} ({} effective atoms, {} residues, CG={})",
             structure.name,
-            structure.n_atoms,
-            structure.n_residues
+            effective_n_atoms,
+            effective_n_residues,
+            self.config.coarse_grained
         );
 
         // Initialize GPU
@@ -192,20 +217,62 @@ impl SimulationRunner {
         let residue_atoms = self.build_residue_atoms(structure)?;
 
         // Create NOVA configuration
+        // For CG (coarse-grained) models, use larger timestep and more leapfrog steps
+        // CG models have no high-frequency bond vibrations, allowing longer trajectories
+        let (dt, leapfrog_steps) = if self.config.coarse_grained {
+            // CG: 5 fs timestep, 10 leapfrog steps = 50 fs per HMC proposal
+            // Short trajectory for high acceptance (~65% target), many proposals for exploration
+            // pfANM springs are soft enough that we need shorter trajectories
+            (0.005, 10)
+        } else {
+            // All-atom: 2 fs timestep, 10 leapfrog steps = 20 fs per HMC proposal
+            (self.config.dt, 10)
+        };
+
         let mut nova_config = NovaConfig {
-            dt: self.config.dt,
+            dt,
             temperature: self.config.temperature,
             goal_strength: self.config.goal_strength,
-            n_atoms: structure.n_atoms as i32,
-            n_residues: structure.n_residues as i32,
+            n_atoms: effective_n_atoms as i32,
+            n_residues: effective_n_residues as i32,
             n_target_residues: structure.pocket_residues.as_ref().map(|p| p.len()).unwrap_or(0) as i32,
+            leapfrog_steps,
             ..NovaConfig::default()
         };
 
-        // Set target residues for pocket analysis
+        // Set target residues for TDA analysis
+        // If pocket residues are specified, use them
+        // Otherwise, use ALL residues (sampled if > MAX_TARGET_RESIDUES)
+        // This ensures TDA always runs and produces meaningful Betti numbers
         if let Some(ref pocket) = structure.pocket_residues {
-            for (i, &res) in pocket.iter().take(prism_gpu::prism_nova::MAX_TARGET_RESIDUES).enumerate() {
+            let n_targets = pocket.len().min(prism_gpu::prism_nova::MAX_TARGET_RESIDUES);
+            nova_config.n_target_residues = n_targets as i32;
+            for (i, &res) in pocket.iter().take(n_targets).enumerate() {
                 nova_config.target_residues[i] = res;
+            }
+            log::info!("TDA targeting {} pocket residues", n_targets);
+        } else {
+            // No pocket specified - use ALL residues for global TDA
+            // Sample uniformly if protein is larger than MAX_TARGET_RESIDUES
+            let max_targets = prism_gpu::prism_nova::MAX_TARGET_RESIDUES;
+            let n_residues = effective_n_residues;
+
+            if n_residues <= max_targets {
+                // Use all residues
+                nova_config.n_target_residues = n_residues as i32;
+                for i in 0..n_residues {
+                    nova_config.target_residues[i] = i as i32;
+                }
+                log::info!("TDA targeting all {} residues", n_residues);
+            } else {
+                // Sample every Nth residue to get ~MAX_TARGET_RESIDUES
+                let step = n_residues / max_targets;
+                nova_config.n_target_residues = max_targets as i32;
+                for i in 0..max_targets {
+                    nova_config.target_residues[i] = (i * step) as i32;
+                }
+                log::info!("TDA targeting {} sampled residues (from {} total, step={})",
+                          max_targets, n_residues, step);
             }
         }
 
@@ -217,6 +284,9 @@ impl SimulationRunner {
         // Upload molecular system
         nova.upload_system(&positions, &masses, &charges, &lj_params, &atom_types, &residue_atoms)
             .context("Failed to upload molecular system")?;
+
+        // Generate and upload topology (bonds, angles, dihedrals)
+        self.upload_topology(&mut nova, structure)?;
 
         // Initialize reservoir with random weights
         let reservoir_weights = self.generate_reservoir_weights();
@@ -247,34 +317,84 @@ impl SimulationRunner {
         &self,
         structure: &SimulationStructure,
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<i32>)> {
-        let n_atoms = structure.all_positions.len();
+        if self.config.coarse_grained {
+            // COARSE-GRAINED MODE: Use C-alpha only (1 atom per residue)
+            // This allows larger proteins to fit in GPU shared memory
+            let n_atoms = structure.ca_positions.len();
 
-        // Flatten positions: [x1, y1, z1, x2, y2, z2, ...]
-        let mut positions = Vec::with_capacity(n_atoms * 3);
-        for pos in &structure.all_positions {
-            positions.push(pos[0]);
-            positions.push(pos[1]);
-            positions.push(pos[2]);
+            // Flatten CA positions: [x1, y1, z1, x2, y2, z2, ...]
+            let mut positions = Vec::with_capacity(n_atoms * 3);
+            for pos in &structure.ca_positions {
+                positions.push(pos[0]);
+                positions.push(pos[1]);
+                positions.push(pos[2]);
+            }
+
+            // Use unified CA properties (~110 Da per residue average)
+            let masses: Vec<f32> = vec![110.0; n_atoms];  // Average residue mass
+            let charges: Vec<f32> = vec![0.0; n_atoms];   // Neutral (no explicit electrostatics)
+            let mut lj_params = Vec::with_capacity(n_atoms * 2);
+            let atom_types: Vec<i32> = vec![0; n_atoms];  // All CA type
+
+            // Coarse-grained: DISABLE LJ interactions
+            // The pfANM springs already model all inter-residue interactions
+            // Adding LJ on top creates competing potentials and low HMC acceptance
+            // For pure ENM/ANM, only harmonic springs are used
+            for _ in 0..n_atoms {
+                lj_params.push(0.0);    // epsilon = 0 (disabled)
+                lj_params.push(1.0);    // sigma (Å) - unused but must be non-zero
+            }
+
+            log::info!("Converted {} residues to COARSE-GRAINED (CA-only) format", n_atoms);
+            Ok((positions, masses, charges, lj_params, atom_types))
+        } else {
+            // ALL-ATOM MODE: Use proper AMBER ff14SB parameters
+            // This uses full atom typing, charges, and LJ parameters from amber_ff14sb.rs
+            let n_atoms = structure.all_positions.len();
+
+            // Flatten positions: [x1, y1, z1, x2, y2, z2, ...]
+            let mut positions = Vec::with_capacity(n_atoms * 3);
+            for pos in &structure.all_positions {
+                positions.push(pos[0]);
+                positions.push(pos[1]);
+                positions.push(pos[2]);
+            }
+
+            // Use proper AMBER ff14SB parameters (NOT simplified element-based!)
+            let mut masses = Vec::with_capacity(n_atoms);
+            let mut charges = Vec::with_capacity(n_atoms);
+            let mut lj_params = Vec::with_capacity(n_atoms * 2);
+            let mut atom_types = Vec::with_capacity(n_atoms);
+
+            for i in 0..n_atoms {
+                let residue_name = &structure.residue_names[i];
+                let atom_name = &structure.atom_names[i];
+
+                // Get proper AMBER atom type
+                let amber_type = AmberAtomType::from_pdb(residue_name, atom_name);
+
+                // Get proper AMBER ff14SB partial charge
+                let charge = get_atom_charge(residue_name, atom_name);
+
+                // Get proper AMBER ff14SB LJ parameters
+                let lj = get_lj_param(amber_type);
+                // Convert from (epsilon, rmin_half) to (epsilon, sigma)
+                // sigma = 2^(1/6) * rmin, where rmin = 2 * rmin_half
+                let sigma = 2.0_f32.powf(1.0/6.0) * 2.0 * lj.rmin_half;
+
+                // Get proper mass from atom type
+                let mass = get_atom_mass(amber_type);
+
+                masses.push(mass);
+                charges.push(charge);
+                lj_params.push(lj.epsilon);
+                lj_params.push(sigma);
+                atom_types.push(amber_type as i32);
+            }
+
+            log::info!("Converted {} atoms to ALL-ATOM format with AMBER ff14SB parameters", n_atoms);
+            Ok((positions, masses, charges, lj_params, atom_types))
         }
-
-        // Derive atomic properties from element types
-        let mut masses = Vec::with_capacity(n_atoms);
-        let mut charges = Vec::with_capacity(n_atoms);
-        let mut lj_params = Vec::with_capacity(n_atoms * 2);
-        let mut atom_types = Vec::with_capacity(n_atoms);
-
-        for (i, element) in structure.elements.iter().enumerate() {
-            let props = self.get_atomic_properties(element, &structure.residue_names[i]);
-
-            masses.push(props.mass);
-            charges.push(props.charge);
-            lj_params.push(props.lj_epsilon);
-            lj_params.push(props.lj_sigma);
-            atom_types.push(props.atom_type);
-        }
-
-        log::info!("Converted {} atoms to simulation format", n_atoms);
-        Ok((positions, masses, charges, lj_params, atom_types))
     }
 
     /// Get atomic properties from element type and residue context
@@ -386,6 +506,16 @@ impl SimulationRunner {
 
     /// Build representative atom indices for each residue (CA atoms)
     fn build_residue_atoms(&self, structure: &SimulationStructure) -> Result<Vec<i32>> {
+        if self.config.coarse_grained {
+            // COARSE-GRAINED MODE: Each "atom" IS a CA residue
+            // So residue_atoms[i] = i (identity mapping)
+            let n_residues = structure.ca_positions.len();
+            let residue_atoms: Vec<i32> = (0..n_residues as i32).collect();
+            log::debug!("CG mode: {} residue atoms (identity mapping)", n_residues);
+            return Ok(residue_atoms);
+        }
+
+        // ALL-ATOM MODE: Find CA atom for each residue
         let mut residue_atoms = vec![-1i32; structure.n_residues];
 
         // Find CA atom for each residue
@@ -407,6 +537,161 @@ impl SimulationRunner {
         }
 
         Ok(residue_atoms)
+    }
+
+    /// Upload molecular topology (bonds, angles, dihedrals) to GPU
+    ///
+    /// For coarse-grained (CA-only) simulations: Uses elastic network model (ENM)
+    /// For all-atom simulations: Uses full AMBER ff14SB topology
+    fn upload_topology(
+        &self,
+        nova: &mut PrismNova,
+        structure: &SimulationStructure,
+    ) -> Result<()> {
+        if self.config.coarse_grained {
+            // Coarse-grained: Elastic Network Model
+            // Build PdbAtom list from CA positions only
+            let mut ca_atoms = Vec::with_capacity(structure.ca_positions.len());
+
+            // We need to map CA positions back to their residue info
+            // Find CA atoms in the all_positions array
+            let mut ca_idx = 0;
+            for (i, name) in structure.atom_names.iter().enumerate() {
+                if name == "CA" && ca_idx < structure.ca_positions.len() {
+                    let pos = structure.ca_positions[ca_idx];
+                    let chain_id = structure.chain_ids.get(i)
+                        .and_then(|s| s.chars().next())
+                        .unwrap_or('A');
+
+                    ca_atoms.push(PdbAtom {
+                        index: ca_idx,
+                        name: "CA".to_string(),
+                        residue_name: structure.residue_names.get(i)
+                            .cloned()
+                            .unwrap_or_else(|| "UNK".to_string()),
+                        residue_id: structure.residue_seqs.get(i)
+                            .copied()
+                            .unwrap_or(ca_idx as i32),
+                        chain_id,
+                        x: pos[0],
+                        y: pos[1],
+                        z: pos[2],
+                    });
+                    ca_idx += 1;
+                }
+            }
+
+            // If we couldn't find CA atoms by name, fall back to sequential
+            if ca_atoms.is_empty() {
+                for (i, pos) in structure.ca_positions.iter().enumerate() {
+                    ca_atoms.push(PdbAtom {
+                        index: i,
+                        name: "CA".to_string(),
+                        residue_name: "UNK".to_string(),
+                        residue_id: i as i32,
+                        chain_id: 'A',
+                        x: pos[0],
+                        y: pos[1],
+                        z: pos[2],
+                    });
+                }
+            }
+
+            // Generate pfANM topology with 8 Å cutoff (reduced from 15Å)
+            // Using smaller cutoff to create sparser network that differentiates
+            // flexible (surface, loop) vs rigid (core) residues
+            // pfANM uses distance-dependent springs: k = C/r² with backbone enhancement
+            let topology = AmberTopology::from_ca_only(&ca_atoms, 8.0);
+            let gpu_topo = GpuTopology::from_amber(&topology);
+
+            log::info!(
+                "pfANM topology: {} springs (cutoff=8Å, k=C/r²)",
+                gpu_topo.bond_list.len() / 2
+            );
+
+            // Upload bonds (ENM has no angles/dihedrals)
+            nova.upload_bonds(&gpu_topo.bond_list, &gpu_topo.bond_params)
+                .context("Failed to upload ENM bonds")?;
+
+            // Empty angles/dihedrals for CG mode
+            nova.upload_angles(&[], &[])
+                .context("Failed to upload empty angles")?;
+            nova.upload_dihedrals(&[], &[], &[])
+                .context("Failed to upload empty dihedrals")?;
+
+            // Empty exclusions/1-4 pairs for CG mode (ENM has simpler non-bonded)
+            nova.upload_exclusions(&[])
+                .context("Failed to upload empty exclusions")?;
+            nova.upload_pairs_14(&[])
+                .context("Failed to upload empty 1-4 pairs")?;
+
+        } else {
+            // All-atom: Full AMBER ff14SB topology
+            let mut pdb_atoms = Vec::with_capacity(structure.n_atoms);
+
+            for i in 0..structure.n_atoms {
+                let pos = structure.all_positions.get(i)
+                    .copied()
+                    .unwrap_or([0.0, 0.0, 0.0]);
+                let chain_id = structure.chain_ids.get(i)
+                    .and_then(|s| s.chars().next())
+                    .unwrap_or('A');
+
+                pdb_atoms.push(PdbAtom {
+                    index: i,
+                    name: structure.atom_names.get(i)
+                        .cloned()
+                        .unwrap_or_else(|| "UNK".to_string()),
+                    residue_name: structure.residue_names.get(i)
+                        .cloned()
+                        .unwrap_or_else(|| "UNK".to_string()),
+                    residue_id: structure.residue_seqs.get(i)
+                        .copied()
+                        .unwrap_or(0),
+                    chain_id,
+                    x: pos[0],
+                    y: pos[1],
+                    z: pos[2],
+                });
+            }
+
+            // Generate full AMBER topology
+            let topology = AmberTopology::from_pdb_atoms(&pdb_atoms);
+            let gpu_topo = GpuTopology::from_amber(&topology);
+
+            log::info!(
+                "AMBER ff14SB topology: {} bonds, {} angles, {} dihedrals, {} 1-4 pairs",
+                gpu_topo.bond_list.len() / 2,
+                gpu_topo.angle_list.len() / 3,
+                gpu_topo.dihedral_list.len() / 4,
+                gpu_topo.pair_14_list.len() / 2
+            );
+
+            // Upload all topology data to GPU
+            nova.upload_bonds(&gpu_topo.bond_list, &gpu_topo.bond_params)
+                .context("Failed to upload bonds")?;
+            nova.upload_angles(&gpu_topo.angle_list, &gpu_topo.angle_params)
+                .context("Failed to upload angles")?;
+            nova.upload_dihedrals(
+                &gpu_topo.dihedral_list,
+                &gpu_topo.dihedral_params,
+                &gpu_topo.dihedral_term_counts,
+            ).context("Failed to upload dihedrals")?;
+
+            // Upload exclusion and 1-4 pair lists for proper AMBER non-bonded interactions
+            nova.upload_exclusions(&gpu_topo.exclusion_list)
+                .context("Failed to upload exclusions")?;
+            nova.upload_pairs_14(&gpu_topo.pair_14_list)
+                .context("Failed to upload 1-4 pairs")?;
+
+            log::info!(
+                "⚖️ AMBER exclusions: {} 1-2/1-3 pairs, {} 1-4 pairs (scaled LJ=0.5, Coul=0.833)",
+                gpu_topo.exclusion_list.len() / 2,
+                gpu_topo.pair_14_list.len() / 2
+            );
+        }
+
+        Ok(())
     }
 
     /// Generate random reservoir weights
@@ -527,6 +812,14 @@ impl SimulationRunner {
 
     /// Extract CA positions from flat position array
     fn extract_ca_positions(&self, positions: &[f32], structure: &SimulationStructure) -> Vec<f32> {
+        // COARSE-GRAINED MODE: All positions ARE CA positions
+        // Each "atom" in CG mode represents one residue's CA
+        if self.config.coarse_grained {
+            // Return all positions - they are already CA positions
+            return positions.to_vec();
+        }
+
+        // ALL-ATOM MODE: Find CA atoms by looking for carbon atoms
         let mut ca_positions = Vec::with_capacity(structure.n_residues * 3);
 
         // Find CA atoms

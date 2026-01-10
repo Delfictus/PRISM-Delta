@@ -53,10 +53,12 @@ use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
 
 /// Maximum atoms supported by NOVA kernel
-pub const MAX_ATOMS: usize = 4096;
+/// NOTE: Reduced from 4096 due to shared memory limits on sm_86
+pub const MAX_ATOMS: usize = 512;
 
 /// Maximum target residues for pocket analysis
-pub const MAX_TARGET_RESIDUES: usize = 64;
+/// NOTE: Reduced from 64 to 32 to fit TDA shared memory (dist_matrix = 32*32*4 = 4KB)
+pub const MAX_TARGET_RESIDUES: usize = 32;
 
 /// Reservoir size (must match kernel constant)
 pub const RESERVOIR_SIZE: usize = 1024;
@@ -116,7 +118,7 @@ impl Default for NovaConfig {
             n_residues: 0,
             n_target_residues: 0,
 
-            leapfrog_steps: 10,     // 10 leapfrog steps per HMC
+            leapfrog_steps: 3,      // Very short trajectory for high acceptance
             mass_scale: 1.0,
 
             nn_hidden_dim: 64,
@@ -170,8 +172,16 @@ pub struct PrismNova {
     d_lj_params: CudaSlice<f32>,       // [n_atoms * 2] (epsilon, sigma)
     d_bond_list: CudaSlice<i32>,       // [n_bonds * 2]
     d_bond_params: CudaSlice<f32>,     // [n_bonds * 2] (r0, k)
+    d_angle_list: CudaSlice<i32>,      // [n_angles * 3] (i, j, k)
+    d_angle_params: CudaSlice<f32>,    // [n_angles * 2] (theta0, k)
+    d_dihedral_list: CudaSlice<i32>,   // [n_dihedrals * 4] (i, j, k, l)
+    d_dihedral_params: CudaSlice<f32>, // Flattened: [k, n, phase, paths, ...] per term
+    d_dihedral_term_counts: CudaSlice<i32>, // [n_dihedrals] - terms per dihedral
+    d_exclusion_list: CudaSlice<i32>,  // [n_exclusions * 2] - 1-2 and 1-3 pairs to skip
+    d_pair_14_list: CudaSlice<i32>,    // [n_pairs_14 * 2] - 1-4 pairs for scaled interactions
     d_atom_types: CudaSlice<i32>,      // [n_atoms]
     d_residue_atoms: CudaSlice<i32>,   // [n_residues] - representative atom per residue
+    d_target_residues: CudaSlice<i32>, // [n_target_residues] - target residues for TDA
 
     // Device memory - Neural network
     d_nn_weights: CudaSlice<f32>,
@@ -195,6 +205,10 @@ pub struct PrismNova {
     // Configuration
     config: NovaConfig,
     n_bonds: usize,
+    n_angles: usize,
+    n_dihedrals: usize,
+    n_exclusions: usize,
+    n_pairs_14: usize,
 }
 
 impl PrismNova {
@@ -269,12 +283,36 @@ impl PrismNova {
         let d_bond_params = stream
             .alloc_zeros::<f32>(1)
             .context("Failed to allocate bond params")?;
+        let d_angle_list = stream
+            .alloc_zeros::<i32>(1)
+            .context("Failed to allocate angle list")?;
+        let d_angle_params = stream
+            .alloc_zeros::<f32>(1)
+            .context("Failed to allocate angle params")?;
+        let d_dihedral_list = stream
+            .alloc_zeros::<i32>(1)
+            .context("Failed to allocate dihedral list")?;
+        let d_dihedral_params = stream
+            .alloc_zeros::<f32>(1)
+            .context("Failed to allocate dihedral params")?;
+        let d_dihedral_term_counts = stream
+            .alloc_zeros::<i32>(1)
+            .context("Failed to allocate dihedral term counts")?;
+        let d_exclusion_list = stream
+            .alloc_zeros::<i32>(1)
+            .context("Failed to allocate exclusion list")?;
+        let d_pair_14_list = stream
+            .alloc_zeros::<i32>(1)
+            .context("Failed to allocate 1-4 pair list")?;
         let d_atom_types = stream
             .alloc_zeros::<i32>(n_atoms)
             .context("Failed to allocate atom types")?;
         let d_residue_atoms = stream
             .alloc_zeros::<i32>(n_residues.max(1))
             .context("Failed to allocate residue atoms")?;
+        let d_target_residues = stream
+            .alloc_zeros::<i32>(MAX_TARGET_RESIDUES)
+            .context("Failed to allocate target residues")?;
 
         // Neural network (placeholder - small initial allocation)
         let nn_size = config.nn_hidden_dim as usize * 32 + config.nn_hidden_dim as usize * 3 + 3;
@@ -351,8 +389,16 @@ impl PrismNova {
             d_lj_params,
             d_bond_list,
             d_bond_params,
+            d_angle_list,
+            d_angle_params,
+            d_dihedral_list,
+            d_dihedral_params,
+            d_dihedral_term_counts,
+            d_exclusion_list,
+            d_pair_14_list,
             d_atom_types,
             d_residue_atoms,
+            d_target_residues,
             d_nn_weights,
             d_reservoir_activations,
             d_reservoir_filtered,
@@ -366,6 +412,10 @@ impl PrismNova {
             d_accepted,
             config,
             n_bonds: 0,
+            n_angles: 0,
+            n_dihedrals: 0,
+            n_exclusions: 0,
+            n_pairs_14: 0,
         })
     }
 
@@ -408,6 +458,16 @@ impl PrismNova {
             .memcpy_htod(residue_atoms, &mut self.d_residue_atoms)
             .context("Failed to upload residue atoms")?;
 
+        // Upload target residues for TDA from config
+        let n_targets = self.config.n_target_residues as usize;
+        if n_targets > 0 {
+            let target_residues: Vec<i32> = self.config.target_residues[..n_targets].to_vec();
+            self.stream
+                .memcpy_htod(&target_residues, &mut self.d_target_residues)
+                .context("Failed to upload target residues")?;
+            log::info!("🎯 Uploaded {} target residues for TDA", n_targets);
+        }
+
         log::info!("✅ System uploaded successfully");
         Ok(())
     }
@@ -442,6 +502,143 @@ impl PrismNova {
             .context("Failed to upload bond params")?;
 
         log::info!("🔗 Uploaded {} bonds", self.n_bonds);
+        Ok(())
+    }
+
+    /// Upload angle topology
+    ///
+    /// # Arguments
+    /// * `angle_list` - Triplets of angle atom indices [n_angles * 3] (i, j, k)
+    /// * `angle_params` - Angle parameters [n_angles * 2] as (theta0, k)
+    pub fn upload_angles(&mut self, angle_list: &[i32], angle_params: &[f32]) -> Result<()> {
+        self.n_angles = angle_list.len() / 3;
+
+        // Reallocate if needed
+        if angle_list.len() > self.d_angle_list.len() {
+            self.d_angle_list = self
+                .stream
+                .alloc_zeros::<i32>(angle_list.len())
+                .context("Failed to reallocate angle list")?;
+        }
+        if angle_params.len() > self.d_angle_params.len() {
+            self.d_angle_params = self
+                .stream
+                .alloc_zeros::<f32>(angle_params.len())
+                .context("Failed to reallocate angle params")?;
+        }
+
+        self.stream
+            .memcpy_htod(angle_list, &mut self.d_angle_list)
+            .context("Failed to upload angle list")?;
+        self.stream
+            .memcpy_htod(angle_params, &mut self.d_angle_params)
+            .context("Failed to upload angle params")?;
+
+        log::info!("📐 Uploaded {} angles", self.n_angles);
+        Ok(())
+    }
+
+    /// Upload dihedral topology
+    ///
+    /// # Arguments
+    /// * `dihedral_list` - Quartets of dihedral atom indices [n_dihedrals * 4] (i, j, k, l)
+    /// * `dihedral_params` - Dihedral parameters, flattened [k, n, phase, paths, ...] per term
+    /// * `term_counts` - Number of terms per dihedral [n_dihedrals]
+    pub fn upload_dihedrals(
+        &mut self,
+        dihedral_list: &[i32],
+        dihedral_params: &[f32],
+        term_counts: &[i32],
+    ) -> Result<()> {
+        self.n_dihedrals = dihedral_list.len() / 4;
+
+        // Reallocate if needed
+        if dihedral_list.len() > self.d_dihedral_list.len() {
+            self.d_dihedral_list = self
+                .stream
+                .alloc_zeros::<i32>(dihedral_list.len())
+                .context("Failed to reallocate dihedral list")?;
+        }
+        if dihedral_params.len() > self.d_dihedral_params.len() {
+            self.d_dihedral_params = self
+                .stream
+                .alloc_zeros::<f32>(dihedral_params.len())
+                .context("Failed to reallocate dihedral params")?;
+        }
+        if term_counts.len() > self.d_dihedral_term_counts.len() {
+            self.d_dihedral_term_counts = self
+                .stream
+                .alloc_zeros::<i32>(term_counts.len())
+                .context("Failed to reallocate dihedral term counts")?;
+        }
+
+        self.stream
+            .memcpy_htod(dihedral_list, &mut self.d_dihedral_list)
+            .context("Failed to upload dihedral list")?;
+        self.stream
+            .memcpy_htod(dihedral_params, &mut self.d_dihedral_params)
+            .context("Failed to upload dihedral params")?;
+        self.stream
+            .memcpy_htod(term_counts, &mut self.d_dihedral_term_counts)
+            .context("Failed to upload dihedral term counts")?;
+
+        log::info!("🔄 Uploaded {} dihedrals", self.n_dihedrals);
+        Ok(())
+    }
+
+    /// Upload exclusion list (1-2 and 1-3 bonded pairs to skip in non-bonded calculation)
+    ///
+    /// # Arguments
+    /// * `exclusion_list` - Flattened pairs [atom_i, atom_j, ...] for all exclusions
+    pub fn upload_exclusions(&mut self, exclusion_list: &[i32]) -> Result<()> {
+        self.n_exclusions = exclusion_list.len() / 2;
+
+        if exclusion_list.is_empty() {
+            log::info!("⊘ No exclusions to upload");
+            return Ok(());
+        }
+
+        // Reallocate if needed
+        if exclusion_list.len() > self.d_exclusion_list.len() {
+            self.d_exclusion_list = self
+                .stream
+                .alloc_zeros::<i32>(exclusion_list.len())
+                .context("Failed to reallocate exclusion list")?;
+        }
+
+        self.stream
+            .memcpy_htod(exclusion_list, &mut self.d_exclusion_list)
+            .context("Failed to upload exclusion list")?;
+
+        log::info!("⊘ Uploaded {} exclusions (1-2/1-3 pairs)", self.n_exclusions);
+        Ok(())
+    }
+
+    /// Upload 1-4 pair list (atoms separated by 3 bonds, need scaled non-bonded interactions)
+    ///
+    /// # Arguments
+    /// * `pair_14_list` - Flattened pairs [atom_i, atom_j, ...] for all 1-4 pairs
+    pub fn upload_pairs_14(&mut self, pair_14_list: &[i32]) -> Result<()> {
+        self.n_pairs_14 = pair_14_list.len() / 2;
+
+        if pair_14_list.is_empty() {
+            log::info!("⚖️ No 1-4 pairs to upload");
+            return Ok(());
+        }
+
+        // Reallocate if needed
+        if pair_14_list.len() > self.d_pair_14_list.len() {
+            self.d_pair_14_list = self
+                .stream
+                .alloc_zeros::<i32>(pair_14_list.len())
+                .context("Failed to reallocate 1-4 pair list")?;
+        }
+
+        self.stream
+            .memcpy_htod(pair_14_list, &mut self.d_pair_14_list)
+            .context("Failed to upload 1-4 pair list")?;
+
+        log::info!("⚖️ Uploaded {} 1-4 pairs (scaled non-bonded)", self.n_pairs_14);
         Ok(())
     }
 
@@ -544,6 +741,23 @@ impl PrismNova {
             builder.arg(&self.d_bond_list);
             builder.arg(&self.d_bond_params);
             builder.arg(&n_bonds_i32);
+            builder.arg(&self.d_angle_list);
+            builder.arg(&self.d_angle_params);
+            let n_angles_i32 = self.n_angles as i32;
+            builder.arg(&n_angles_i32);
+            builder.arg(&self.d_dihedral_list);
+            builder.arg(&self.d_dihedral_params);
+            builder.arg(&self.d_dihedral_term_counts);
+            let n_dihedrals_i32 = self.n_dihedrals as i32;
+            builder.arg(&n_dihedrals_i32);
+
+            // Exclusions (1-2/1-3 bonded pairs) and 1-4 scaled pairs
+            builder.arg(&self.d_exclusion_list);
+            let n_exclusions_i32 = self.n_exclusions as i32;
+            builder.arg(&n_exclusions_i32);
+            builder.arg(&self.d_pair_14_list);
+            let n_pairs_14_i32 = self.n_pairs_14 as i32;
+            builder.arg(&n_pairs_14_i32);
 
             // Neural network
             builder.arg(&self.d_nn_weights);
@@ -567,6 +781,10 @@ impl PrismNova {
             builder.arg(&mut self.d_features);
             builder.arg(&mut self.d_reward);
             builder.arg(&mut self.d_accepted);
+
+            // Target residues for TDA
+            builder.arg(&self.d_target_residues);
+            builder.arg(&self.config.n_target_residues);
 
             // Config struct - need to upload to GPU
             // For now, pass key config values individually

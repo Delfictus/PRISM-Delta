@@ -19,6 +19,13 @@ pub mod materials;
 // Molecular Dynamics - PIMC/NLNM Solvers for protein structures
 pub mod molecular_dynamics;
 
+// AMBER ff14SB force field implementation
+pub mod amber_ff14sb;
+
+// Gaussian Network Model for protein flexibility prediction
+pub mod gnm;
+pub use gnm::{GaussianNetworkModel, AnisotropicNetworkModel, GnmResult};
+
 /// CMA-ES (Covariance Matrix Adaptation Evolution Strategy) configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CmaEsConfig {

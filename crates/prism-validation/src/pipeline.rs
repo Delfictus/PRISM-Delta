@@ -43,6 +43,10 @@ pub struct SimulationStructure {
     pub chain_ids: Vec<String>,
     /// B-factors (temperature factors)
     pub b_factors: Vec<f32>,
+    /// Atom names (e.g., "CA", "N", "O", "CB")
+    pub atom_names: Vec<String>,
+    /// Residue sequence numbers (from PDB)
+    pub residue_seqs: Vec<i32>,
     /// Number of residues
     pub n_residues: usize,
     /// Number of atoms
@@ -61,6 +65,8 @@ impl SimulationStructure {
         let mut residue_names = Vec::new();
         let mut chain_ids = Vec::new();
         let mut b_factors = Vec::new();
+        let mut atom_names = Vec::new();
+        let mut residue_seqs = Vec::new();
 
         // Build residue index map
         let mut res_to_idx: HashMap<String, usize> = HashMap::new();
@@ -80,6 +86,8 @@ impl SimulationStructure {
             b_factors.push(atom.b_factor);
             chain_ids.push(atom.chain_id.clone());
             residue_names.push(atom.res_name.clone());
+            atom_names.push(atom.name.clone());
+            residue_seqs.push(atom.res_seq);
 
             let res_key = format!("{}:{}", atom.chain_id, atom.res_seq);
             let res_idx = res_to_idx.get(&res_key).copied().unwrap_or(0);
@@ -102,6 +110,8 @@ impl SimulationStructure {
             residue_names,
             chain_ids,
             b_factors,
+            atom_names,
+            residue_seqs,
             n_residues: metadata.residues.len(),
             n_atoms: metadata.atoms.len(),
             pocket_residues,

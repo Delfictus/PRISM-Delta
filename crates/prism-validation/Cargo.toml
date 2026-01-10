@@ -9,6 +9,7 @@ authors = ["PRISM Team"]
 # GPU dependencies - optional for curation-only builds
 prism-gpu = { path = "../prism-gpu", optional = true }
 prism-core = { path = "../prism-core", optional = true }
+prism-physics = { path = "../prism-physics", optional = true }
 cudarc = { version = "0.18", optional = true }
 
 # Serialization
@@ -29,6 +30,9 @@ statrs = "0.16"
 log = "0.4"
 env_logger = "0.10"
 
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
@@ -48,8 +52,8 @@ indicatif = "0.17"
 [features]
 default = []
 cuda = ["prism-gpu/cuda", "prism-gpu", "cudarc"]
-full = ["prism-gpu", "prism-core", "cudarc"]
-simulation = ["prism-gpu", "cudarc"]
+full = ["prism-gpu", "prism-core", "prism-physics", "cudarc"]
+simulation = ["prism-gpu", "prism-physics", "cudarc"]
 
 [[bin]]
 name = "prism-validate"
@@ -66,4 +70,17 @@ path = "src/bin/run_validation.rs"
 [[bin]]
 name = "prism-validate-physics"
 path = "src/bin/validate_with_physics.rs"
+required-features = ["simulation"]
+
+[[bin]]
+name = "prism-atlas"
+path = "src/bin/run_atlas.rs"
+
+[[bin]]
+name = "prism-bench"
+path = "src/bin/run_prism_bench.rs"
+
+[[bin]]
+name = "prism-bench-real"
+path = "src/bin/run_prism_bench_real.rs"
 required-features = ["simulation"]

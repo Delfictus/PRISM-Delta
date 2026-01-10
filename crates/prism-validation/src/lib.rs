@@ -25,9 +25,17 @@ pub mod reports;
 pub mod data_curation;
 pub mod pipeline;
 pub mod benchmark_integration;
+pub mod alphaflow_compat;
+pub mod prism_bench;
 
 #[cfg(feature = "simulation")]
 pub mod simulation_runner;
+
+// Re-export AlphaFlow compatibility for easy access
+pub use alphaflow_compat::{
+    AlphaFlowEnsemble, AlphaFlowMetrics, AtlasBenchmarkRunner,
+    AtlasBenchmarkResult, AtlasBenchmarkSummary, AtlasTarget,
+};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

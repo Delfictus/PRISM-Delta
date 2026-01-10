@@ -238,6 +238,14 @@ fn main() {
     //     &target_ptx_dir.join("viral_evolution_fitness.ptx"),
     // );
 
+    // Compile PRISM-NOVA kernel (Hamiltonian Monte Carlo + Active Inference physics engine)
+    compile_kernel(
+        &nvcc,
+        "src/kernels/prism_nova.cu",
+        &ptx_dir.join("prism_nova.ptx"),
+        &target_ptx_dir.join("prism_nova.ptx"),
+    );
+
     println!("cargo:info=PTX compilation completed successfully");
 }
 
