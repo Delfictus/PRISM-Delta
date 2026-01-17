@@ -42,6 +42,9 @@ blake3 = "1.5"
 log = { workspace = true }
 env_logger = "0.11"
 
+# CLI argument parsing
+clap = { version = "4.4", features = ["derive"] }
+
 # GPU
 cudarc = { workspace = true, optional = true, features = ["std", "cuda-12050", "driver", "nvrtc"] }
 uuid = { workspace = true, features = ["v4"] }
@@ -60,6 +63,15 @@ required-features = ["cuda"]
 name = "test-gpu-gnm"
 path = "src/bin/test_gpu_gnm.rs"
 required-features = ["cuda"]
+
+[[bin]]
+name = "run_amber_md"
+path = "src/bin/run_amber_md.rs"
+required-features = ["cuda"]
+
+[[bin]]
+name = "test_prmtop"
+path = "src/bin/test_prmtop.rs"
 
 [features]
 default = []

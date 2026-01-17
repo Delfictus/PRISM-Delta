@@ -22,6 +22,12 @@ pub mod molecular_dynamics;
 // AMBER ff14SB force field implementation
 pub mod amber_ff14sb;
 
+// AMBER prmtop/inpcrd file parsers (for validated topology from tleap)
+pub mod amber_prmtop;
+pub mod amber_inpcrd;
+pub use amber_prmtop::AmberPrmtop;
+pub use amber_inpcrd::{AmberInpcrd, AmberSystem, GpuSystemArrays, GpuTopologyData};
+
 // TIP3P water model for explicit solvent
 pub mod water_model;
 pub use water_model::{TIP3PWater, WaterMolecule, Ion, IonType};

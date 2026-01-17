@@ -3890,6 +3890,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "blake3",
+ "clap",
  "criterion",
  "cudarc",
  "env_logger 0.11.8",
